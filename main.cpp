@@ -1,178 +1,205 @@
-
 #include <iostream>
 #include <vector>
 #include <queue>
 #include <pthread.h>
 #include <fstream>
 #include <cstdlib>
+#include <chrono> // Biblioteca para medir o tempo
 
-// Configurações da tela (resolução do fractal)
-const int WIDTH = 800;
-const int HEIGHT = 800;
-const double X_MIN = -2.0, X_MAX = 1.0;
-const double Y_MIN = -1.5, Y_MAX = 1.5;
+using namespace std; // Evita ter que digitar std:: o tempo todo
 
-// 1. Estrutura da Tarefa ("Quadrado")
+// Tamanho fixo da tela
+int WIDTH = 800;
+int HEIGHT = 800;
+
+// Matriz global para guardar a imagem (forma mais simples)
+int imagem_final[800][800];
+
+// Estruturas de dados pedidas no quadro
 struct Task {
-    int x0, y0;     // Coordenada inicial do bloco na tela
-    int w, h;       // Largura e altura do bloco
+    int x, y; // Posição inicial do bloco
+    int w, h; // Largura e altura do bloco
 };
 
-// 2. Estrutura do Resultado
 struct Result {
     Task t;
-    std::vector<int> pixels; // Vetor com as cores (iterações) calculadas
+    vector<int> pixels; // Guarda as cores calculadas
 };
 
-// --- Buffers Compartilhados e Sincronização ---
-std::queue<Task> task_buffer;
-std::queue<Result> result_buffer;
+// Buffers globais
+queue<Task> fila_tarefas;
+queue<Result> fila_resultados;
 
-pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t result_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t result_cv = PTHREAD_COND_INITIALIZER; // Avisa a thread principal sobre novos resultados
+// Travas do Pthreads (Mutexes)
+pthread_mutex_t mutex_tarefa = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_resultado = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t aviso_resultado = PTHREAD_COND_INITIALIZER;
 
-int completed_tasks = 0;
-int total_tasks = 0;
-int max_iterations = 1000; // Complexidade padrão
+// Variáveis de controle
+int tarefas_prontas = 0;
+int total_tarefas = 0;
+int max_iteracoes = 1000;
 
-// --- Função da Thread Trabalhadora (Worker) ---
-void* worker_routine(void* arg) {
+// Função que cada thread vai executar
+void* trabalhador(void* arg) {
     while (true) {
-        Task t;
+        Task tarefa_atual;
         
-        // 1. Pegar uma tarefa do Task Buffer
-        pthread_mutex_lock(&task_mutex);
-        if (task_buffer.empty()) {
-            pthread_mutex_unlock(&task_mutex);
-            break; // Se não há mais tarefas, a thread encerra
+        // 1. Tenta pegar uma tarefa na fila
+        pthread_mutex_lock(&mutex_tarefa);
+        if (fila_tarefas.empty()) {
+            pthread_mutex_unlock(&mutex_tarefa);
+            break; // Sai do loop e encerra a thread se não tiver mais trabalho
         }
-        t = task_buffer.front();
-        task_buffer.pop();
-        pthread_mutex_unlock(&task_mutex);
+        tarefa_atual = fila_tarefas.front();
+        fila_tarefas.pop();
+        pthread_mutex_unlock(&mutex_tarefa);
 
-        // 2. Computar a tarefa (Calcular o Mandelbrot para o bloco)
-        Result r;
-        r.t = t;
-        r.pixels.reserve(t.w * t.h);
+        // 2. Faz as contas do Mandelbrot
+        Result resultado_atual;
+        resultado_atual.t = tarefa_atual;
 
-        for (int py = 0; py < t.h; ++py) {
-            for (int px = 0; px < t.w; ++px) {
-                // Mapear pixel para o plano complexo
-                double cx = X_MIN + (t.x0 + px) * (X_MAX - X_MIN) / WIDTH;
-                double cy = Y_MIN + (t.y0 + py) * (Y_MAX - Y_MIN) / HEIGHT;
+        for (int py = 0; py < tarefa_atual.h; py++) {
+            for (int px = 0; px < tarefa_atual.w; px++) {
+                
+                // Converte o pixel para coordenadas do plano complexo
+                double cx = -2.0 + (tarefa_atual.x + px) * 3.0 / WIDTH;
+                double cy = -1.5 + (tarefa_atual.y + py) * 3.0 / HEIGHT;
                 
                 double zx = 0.0, zy = 0.0;
                 int iter = 0;
                 
-                // Fórmula de Mandelbrot: Z = Z^2 + C
-                while (zx * zx + zy * zy <= 4.0 && iter < max_iterations) {
-                    double zx_new = zx * zx - zy * zy + cx;
+                while (zx * zx + zy * zy <= 4.0 && iter < max_iteracoes) {
+                    double novo_zx = zx * zx - zy * zy + cx;
                     zy = 2.0 * zx * zy + cy;
-                    zx = zx_new;
+                    zx = novo_zx;
                     iter++;
                 }
-                r.pixels.push_back(iter);
+                // Guarda o resultado desse pixel
+                resultado_atual.pixels.push_back(iter);
             }
         }
 
-        // 3. Gravar no Buffer Resultado
-        pthread_mutex_lock(&result_mutex);
-        result_buffer.push(r);
-        completed_tasks++;
-        pthread_cond_signal(&result_cv); // Acorda a Main Thread para desenhar
-        pthread_mutex_unlock(&result_mutex);
+        // 3. Coloca o resultado pronto no buffer
+        pthread_mutex_lock(&mutex_resultado);
+        fila_resultados.push(resultado_atual);
+        tarefas_prontas++;
+        pthread_cond_signal(&aviso_resultado); // Avisa a main que tem resultado
+        pthread_mutex_unlock(&mutex_resultado);
     }
-    return nullptr;
+    return NULL;
 }
 
 int main(int argc, char* argv[]) {
-    // Parâmetros do programa exigidos no quadro
+    // Verifica se a pessoa digitou os 3 parametros certos
     if (argc != 4) {
-        std::cerr << "Uso: " << argv[0] << " <num_threads> <complexidade> <tamanho_tarefa>\n";
+        cout << "Erro. Use: mandelbrot.exe <threads> <iteracoes> <tamanho_tarefa>" << endl;
         return 1;
     }
 
-    int num_threads = std::atoi(argv[1]);
-    max_iterations = std::atoi(argv[2]);
-    int task_size = std::atoi(argv[3]);
+    int num_threads = atoi(argv[1]);
+    max_iteracoes = atoi(argv[2]);
+    int tamanho_bloco = atoi(argv[3]);
 
-    // Matriz final da imagem
-    std::vector<std::vector<int>> image(HEIGHT, std::vector<int>(WIDTH, 0));
+    // INICIA O CRONÔMETRO
+    auto tempo_inicio = chrono::high_resolution_clock::now();
 
-    // --- Etapa Main: Criar as Tarefas ---
-    pthread_mutex_lock(&task_mutex);
-    for (int y = 0; y < HEIGHT; y += task_size) {
-        for (int x = 0; x < WIDTH; x += task_size) {
-            Task t;
-            t.x0 = x;
-            t.y0 = y;
-            t.w = std::min(task_size, WIDTH - x);
-            t.h = std::min(task_size, HEIGHT - y);
-            task_buffer.push(t);
-            total_tasks++;
+    // --- Etapa 1: Dividir a tela em tarefas ---
+    pthread_mutex_lock(&mutex_tarefa);
+    for (int y = 0; y < HEIGHT; y += tamanho_bloco) {
+        for (int x = 0; x < WIDTH; x += tamanho_bloco) {
+            Task nova_tarefa;
+            nova_tarefa.x = x;
+            nova_tarefa.y = y;
+            
+            // Tratamento basico caso o bloco passe da borda da tela
+            if (x + tamanho_bloco > WIDTH) {
+                nova_tarefa.w = WIDTH - x;
+            } else {
+                nova_tarefa.w = tamanho_bloco;
+            }
+
+            if (y + tamanho_bloco > HEIGHT) {
+                nova_tarefa.h = HEIGHT - y;
+            } else {
+                nova_tarefa.h = tamanho_bloco;
+            }
+
+            fila_tarefas.push(nova_tarefa);
+            total_tarefas++;
         }
     }
-    pthread_mutex_unlock(&task_mutex);
+    pthread_mutex_unlock(&mutex_tarefa);
 
-    // --- Criar as Threads Trabalhadoras ---
-    std::vector<pthread_t> threads(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_create(&threads[i], nullptr, worker_routine, nullptr);
+    // --- Etapa 2: Criar as Threads ---
+    // Usando um vetor fixo de 100 posições por simplicidade
+    pthread_t threads[100]; 
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], NULL, trabalhador, NULL);
     }
 
-    // --- Etapa Main/Renderizador: Print na tela (consumir resultados) ---
+    // --- Etapa 3: Ler os resultados e pintar a matriz ---
     while (true) {
-        pthread_mutex_lock(&result_mutex);
+        pthread_mutex_lock(&mutex_resultado);
         
-        // Espera até que haja um resultado ou que todas as tarefas acabem
-        while (result_buffer.empty() && completed_tasks < total_tasks) {
-            pthread_cond_wait(&result_cv, &result_mutex);
+        // Espera de forma dorminhoca até que tenha resultado novo
+        while (fila_resultados.empty() && tarefas_prontas < total_tarefas) {
+            pthread_cond_wait(&aviso_resultado, &mutex_resultado);
         }
 
-        // Consome todos os resultados disponíveis no buffer no momento
-        while (!result_buffer.empty()) {
-            Result r = result_buffer.front();
-            result_buffer.pop();
+        // Lê todos os resultados que já chegaram
+        while (!fila_resultados.empty()) {
+            Result r = fila_resultados.front();
+            fila_resultados.pop();
 
-            // "Pintar" o bloco na matriz da imagem final
-            int i = 0;
-            for (int py = 0; py < r.t.h; ++py) {
-                for (int px = 0; px < r.t.w; ++px) {
-                    image[r.t.y0 + py][r.t.x0 + px] = r.pixels[i++];
+            int contador = 0;
+            for (int py = 0; py < r.t.h; py++) {
+                for (int px = 0; px < r.t.w; px++) {
+                    imagem_final[r.t.y + py][r.t.x + px] = r.pixels[contador];
+                    contador++;
                 }
             }
         }
 
-        bool finished = (completed_tasks == total_tasks);
-        pthread_mutex_unlock(&result_mutex);
+        // Verifica se terminou tudo antes de soltar o cadeado
+        bool terminou_tudo = (tarefas_prontas == total_tarefas);
+        pthread_mutex_unlock(&mutex_resultado);
 
-        if (finished) break;
+        if (terminou_tudo) break; // Sai do while principal
     }
 
-    // Aguarda todas as threads finalizarem limpas
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_join(threads[i], nullptr);
+    // Junta as threads (boa prática para limpar a memória)
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
     }
 
-    // --- Gerar o arquivo da imagem (.ppm) ---
-    std::ofstream img("mandelbrot.ppm");
-    img << "P3\n" << WIDTH << " " << HEIGHT << "\n255\n"; // Cabeçalho PPM
-    for (int y = 0; y < HEIGHT; ++y) {
-        for (int x = 0; x < WIDTH; ++x) {
-            int iter = image[y][x];
-            // Colorização básica baseada no número de iterações
-            if (iter == max_iterations) {
-                img << "0 0 0 "; // Preto (pertence ao conjunto)
+    // PARA O CRONÔMETRO
+    auto tempo_fim = chrono::high_resolution_clock::now();
+    chrono::duration<double> duracao = tempo_fim - tempo_inicio;
+    
+    // Print do tempo
+    cout << "Tempo gasto com " << num_threads << " thread(s): " << duracao.count() << " segundos." << endl;
+
+    // --- Etapa 4: Gerar arquivo da Imagem ---
+    ofstream arquivo_img("mandelbrot.ppm");
+    arquivo_img << "P3\n" << WIDTH << " " << HEIGHT << "\n255\n"; // Cabeçalho mágico do arquivo
+    
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            int iter = imagem_final[y][x];
+            
+            if (iter == max_iteracoes) {
+                arquivo_img << "0 0 0 "; // Pixel preto
             } else {
-                int color = (iter * 255) / max_iterations;
-                img << color << " " << (color * 2) % 255 << " " << (color * 5) % 255 << " "; 
+                // Matemática simples pra gerar umas cores azuis/verdes
+                arquivo_img << (iter % 255) << " " << ((iter * 2) % 255) << " " << ((iter * 5) % 255) << " ";
             }
         }
-        img << "\n";
+        arquivo_img << "\n";
     }
-    img.close();
+    arquivo_img.close();
 
-    std::cout << "Processamento concluído. Imagem salva como 'mandelbrot.ppm'." << std::endl;
+    cout << "Imagem mandelbrot.ppm criada com sucesso." << endl;
+    
     return 0;
 }
