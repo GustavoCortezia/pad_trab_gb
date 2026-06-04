@@ -13,7 +13,7 @@ O sistema foi desenvolvido utilizando a biblioteca nativa **Pthreads** (memória
 ### Compilar: 
 
 ```bash
-g++ -O3 mandelbrot.cpp -o mandelbrot.exe -lpthread
+g++ -O3 main.cpp -o main.exe -lpthread
 
 ```
 
@@ -28,14 +28,14 @@ O programa exige **três parâmetros** obrigatórios na linha de comando:
 *No Windows (PowerShell/CMD):*
 
 ```powershell
-.\mandelbrot.exe 4 1000 32
+.\main.exe 4 1000 32
 
 ```
 
 *No Linux/macOS/WSL:*
 
 ```bash
-./mandelbrot 4 1000 32
+./main 4 1000 32
 
 ```
 
